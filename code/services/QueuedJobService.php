@@ -236,6 +236,7 @@ class QueuedJobService {
 		// see if there's any blocked jobs that need to be resumed
 		$waitingJob = $list
 			->filter('JobStatus', QueuedJob::STATUS_WAIT)
+			->where('ProcessGUID IS NULL')
 			->first();
 		if ($waitingJob) {
 			return $waitingJob;
@@ -245,6 +246,7 @@ class QueuedJobService {
 		// that we're still executing
 		$runningJob = $list
 			->filter('JobStatus', array(QueuedJob::STATUS_INIT, QueuedJob::STATUS_RUN))
+			->where('ProcessGUID IS NOT NULL')
 			->first();
 		if ($runningJob) {
 			return false;
@@ -257,6 +259,7 @@ class QueuedJobService {
 				'"StartAfter" < \'%s\' OR "StartAfter" IS NULL',
 				SS_DateTime::now()->getValue()
 			))
+			->where('ProcessGUID IS NULL')
 			->first();
 
 		return $newJob;
@@ -269,11 +272,11 @@ class QueuedJobService {
 	 * This typically happens when a PHP fatal error is thrown, which can't be picked up by the error
 	 * handler or exception checker; in this case, we detect these stalled jobs later and fix (try) to
 	 * fix them
-     *
-     * @param int $queue The queue to check against
+	 *
+	 * @param int $queue The queue to check against
 	 */
 	public function checkJobHealth($queue = null) {
-        $queue = $queue ?: QueuedJob::QUEUED;
+		$queue = $queue ?: QueuedJob::QUEUED;
 		// Select all jobs currently marked as running
 		$runningJobs = QueuedJobDescriptor::get()
 			->filter(array(
@@ -281,7 +284,7 @@ class QueuedJobService {
 					QueuedJob::STATUS_RUN,
 					QueuedJob::STATUS_INIT,
 				),
-                'JobType' => $queue,
+				'JobType' => $queue,
 			));
 
 		// If no steps have been processed since the last run, consider it a broken job
@@ -462,20 +465,49 @@ class QueuedJobService {
 		// This deliberately does not use write() as that would always update LastEdited
 		// and thus the row would always be affected.
 		try {
+			// Start a transaction which will hold until we have a lock on this descriptor.
+			DB::get_conn()->transactionStart();
+			$row = DB::query(
+				sprintf(
+					"SELECT ID, UUID() as mutex, ProcessGUID FROM QueuedJobDescriptor WHERE \"ID\" = %s AND ProcessGUID IS NULL FOR UPDATE",
+					$jobDescriptor->ID
+				)
+			)->first();
+
+			// If the row is not returned, then it was reserved by another thread instead.
+			if (!isset($row['mutex'])) {
+				throw new Exception("Queued Jobs - Obtaining mutex failed (job locked to another thread)");
+			}
+			$mutex = $row['mutex'];
+
+			// otherwise reserve this row.
 			DB::query(sprintf(
-				'UPDATE "QueuedJobDescriptor" SET "JobStatus" = \'%s\' WHERE "ID" = %s',
+				'UPDATE "QueuedJobDescriptor" SET "JobStatus" = \'%s\' , "ProcessGUID" = \'%s\' WHERE "ID" = %s',
 				QueuedJob::STATUS_INIT,
+				$mutex,
 				$jobDescriptor->ID
 			));
+
+			// make sure we've got our row, and everything is fine.
+			$row = DB::query(
+				sprintf("SELECT ID, ProcessGUID FROM QueuedJobDescriptor WHERE \"ID\" = %s", $jobDescriptor->ID)
+			)->first();
+			DB::get_conn()->transactionEnd();
+
+			// if the job status isn't initalising, or we found a process id different to the one we should.
+			if(!$row && ($jobDescriptor->JobStatus !== QueuedJob::STATUS_INIT || $row['ProcessGUID'] != $mutex)) {
+				throw new Exception("Wrong status or process. Job reserved already");
+			}
+
+			return true;
+
 		} catch(Exception $e) {
+			echo '[' . date('Y-m-d H:i:s') . "] - Queued Jobs - Error {$e->getMessage()} {$jobDescriptor->ID} \n";
+			// If there's an exception during execution, we may need to revert the transaction.
+			DB::get_conn()->transactionRollback();
+			DB::get_conn()->transactionEnd();
 			return false;
 		}
-
-		if(DB::getConn()->affectedRows() === 0 && $jobDescriptor->JobStatus !== QueuedJob::STATUS_INIT) {
-			return false;
-		}
-
-		return true;
 	}
 
 	/**
@@ -547,13 +579,12 @@ class QueuedJobService {
 					$jobDescriptor->JobRestarted = date('Y-m-d H:i:s');
 				}
 
-
-		                // Only write to job as "Running" if 'isComplete' was NOT set to true
-       			        // during setup() or prepareForRestart()
-		                if (!$job->jobFinished()) {
-		                    $jobDescriptor->JobStatus = QueuedJob::STATUS_RUN;
-		                    $jobDescriptor->write();
-		                }
+				// Only write to job as "Running" if 'isComplete' was NOT set to true
+				// during setup() or prepareForRestart()
+				if (!$job->jobFinished()) {
+					$jobDescriptor->JobStatus = QueuedJob::STATUS_RUN;
+					$jobDescriptor->write();
+				}
 
 				$lastStepProcessed = 0;
 				// have we stalled at all?
@@ -594,18 +625,18 @@ class QueuedJobService {
 					}
 
 					if (!$broken) {
-                        // Collect output as job messages as well as sending it to the screen
-                        $obLogger = function ($buffer, $phase) use ($job, $jobDescriptor) {
-                            $job->addMessage($buffer);
+						// Collect output as job messages as well as sending it to the screen
+						$obLogger = function ($buffer, $phase) use ($job, $jobDescriptor) {
+							$job->addMessage($buffer);
 
-                            if ($jobDescriptor) {
-                                $this->copyJobToDescriptor($job, $jobDescriptor);
-                                $jobDescriptor->write();
-                            }
+							if ($jobDescriptor) {
+								$this->copyJobToDescriptor($job, $jobDescriptor);
+								$jobDescriptor->write();
+							}
 
-                            return $buffer;
-                        };
-                        ob_start($obLogger, 256);
+							return $buffer;
+						};
+						ob_start($obLogger, 256);
 
 						try {
 							$job->process();
@@ -616,7 +647,7 @@ class QueuedJobService {
 							$jobDescriptor->JobStatus =  QueuedJob::STATUS_BROKEN;
 						}
 
-                        ob_end_flush();
+						ob_end_flush();
 
 						// now check the job state
 						$data = $job->getJobData();
@@ -638,9 +669,9 @@ class QueuedJobService {
 								$this->humanReadable($this->getMemoryUsage())
 							));
 
-                            if ($jobDescriptor->JobStatus != QueuedJob::STATUS_BROKEN) {
-                                $jobDescriptor->JobStatus = QueuedJob::STATUS_WAIT;
-                            }
+							if ($jobDescriptor->JobStatus != QueuedJob::STATUS_BROKEN) {
+								$jobDescriptor->JobStatus = QueuedJob::STATUS_WAIT;
+							}
 
 							$broken = true;
 						}
@@ -652,8 +683,8 @@ class QueuedJobService {
 								'Queue has passed time limit and will restart before continuing'
 							));
 							if ($jobDescriptor->JobStatus != QueuedJob::STATUS_BROKEN) {
-                                $jobDescriptor->JobStatus = QueuedJob::STATUS_WAIT;
-                            }
+								$jobDescriptor->JobStatus = QueuedJob::STATUS_WAIT;
+							}
 							$broken = true;
 						}
 					}
@@ -675,6 +706,8 @@ class QueuedJobService {
 
 				// a last final save. The job is complete by now
 				if ($jobDescriptor) {
+					// reset the process GUID since we're finished
+					$jobDescriptor->ProcessGUID = null;
 					$jobDescriptor->write();
 				}
 
@@ -890,12 +923,16 @@ class QueuedJobService {
 
 			$job = $this->getNextPendingJob($name);
 			if ($job) {
+				echo $prefix = '[' . date('Y-m-d H:i:s') . ']  Processing ' . $job->Title;
 				$success = $this->runJob($job->ID);
 				if (!$success) {
+					echo ' [' . date('Y-m-d H:i:s') . "] - Failed \n";
 					// make sure job is null so it doesn't continue the current
 					// processing loop. Next queue executor can pick up where
 					// things left off
 					$job = null;
+				} else {
+					echo ' [' . date('Y-m-d H:i:s') . "] - Success \n";
 				}
 			}
 		} while($job);
